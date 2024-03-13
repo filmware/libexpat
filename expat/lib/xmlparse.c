@@ -78,12 +78,6 @@
 #  error XML_CONTEXT_BYTES must be defined, non-empty and >=0 (0 to disable, >=1 to enable; 1024 is a common default)
 #endif
 
-#if defined(HAVE_SYSCALL_GETRANDOM)
-#  if ! defined(_GNU_SOURCE)
-#    define _GNU_SOURCE 1 /* syscall prototype */
-#  endif
-#endif
-
 #ifdef _WIN32
 /* force stdlib to define rand_s() */
 #  if ! defined(_CRT_RAND_S)
@@ -100,16 +94,7 @@
 #include <stdlib.h> /* getenv, rand_s */
 #include <stdint.h> /* uintptr_t */
 #include <math.h>   /* isnan */
-
-#ifdef _WIN32
-#  define getpid GetCurrentProcessId
-#else
-#  include <sys/time.h>  /* gettimeofday() */
-#  include <sys/types.h> /* getpid() */
-#  include <unistd.h>    /* getpid() */
-#  include <fcntl.h>     /* O_RDONLY */
-#  include <errno.h>
-#endif
+#include <sys/random.h> /* webc_getrandom */
 
 #ifdef _WIN32
 #  include "winconfig.h"
@@ -119,49 +104,8 @@
 #include "expat.h"
 #include "siphash.h"
 
-#if defined(HAVE_GETRANDOM) || defined(HAVE_SYSCALL_GETRANDOM)
-#  if defined(HAVE_GETRANDOM)
-#    include <sys/random.h> /* getrandom */
-#  else
-#    include <unistd.h>      /* syscall */
-#    include <sys/syscall.h> /* SYS_getrandom */
-#  endif
-#  if ! defined(GRND_NONBLOCK)
-#    define GRND_NONBLOCK 0x0001
-#  endif /* defined(GRND_NONBLOCK) */
-#endif   /* defined(HAVE_GETRANDOM) || defined(HAVE_SYSCALL_GETRANDOM) */
-
-#if defined(HAVE_LIBBSD)                                                       \
-    && (defined(HAVE_ARC4RANDOM_BUF) || defined(HAVE_ARC4RANDOM))
-#  include <bsd/stdlib.h>
-#endif
-
 #if defined(_WIN32) && ! defined(LOAD_LIBRARY_SEARCH_SYSTEM32)
 #  define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
-#endif
-
-#if ! defined(HAVE_GETRANDOM) && ! defined(HAVE_SYSCALL_GETRANDOM)             \
-    && ! defined(HAVE_ARC4RANDOM_BUF) && ! defined(HAVE_ARC4RANDOM)            \
-    && ! defined(XML_DEV_URANDOM) && ! defined(_WIN32)                         \
-    && ! defined(XML_POOR_ENTROPY)
-#  error You do not have support for any sources of high quality entropy \
-    enabled.  For end user security, that is probably not what you want. \
-    \
-    Your options include: \
-      * Linux >=3.17 + glibc >=2.25 (getrandom): HAVE_GETRANDOM, \
-      * Linux >=3.17 + glibc (including <2.25) (syscall SYS_getrandom): HAVE_SYSCALL_GETRANDOM, \
-      * BSD / macOS >=10.7 / glibc >=2.36 (arc4random_buf): HAVE_ARC4RANDOM_BUF, \
-      * BSD / macOS (including <10.7) / glibc >=2.36 (arc4random): HAVE_ARC4RANDOM, \
-      * libbsd (arc4random_buf): HAVE_ARC4RANDOM_BUF + HAVE_LIBBSD, \
-      * libbsd (arc4random): HAVE_ARC4RANDOM + HAVE_LIBBSD, \
-      * Linux (including <3.17) / BSD / macOS (including <10.7) / Solaris >=8 (/dev/urandom): XML_DEV_URANDOM, \
-      * Windows >=Vista (rand_s): _WIN32. \
-    \
-    If insist on not using any of these, bypass this error by defining \
-    XML_POOR_ENTROPY; you have been warned. \
-    \
-    If you have reasons to patch this detection code away or need changes \
-    to the build system, please open a bug.  Thank you!
 #endif
 
 #ifdef XML_UNICODE
@@ -783,159 +727,6 @@ static const XML_Char implicitContext[]
        ASCII_s,     ASCII_p,     ASCII_a,      ASCII_c,      ASCII_e,
        '\0'};
 
-/* To avoid warnings about unused functions: */
-#if ! defined(HAVE_ARC4RANDOM_BUF) && ! defined(HAVE_ARC4RANDOM)
-
-#  if defined(HAVE_GETRANDOM) || defined(HAVE_SYSCALL_GETRANDOM)
-
-/* Obtain entropy on Linux 3.17+ */
-static int
-writeRandomBytes_getrandom_nonblock(void *target, size_t count) {
-  int success = 0; /* full count bytes written? */
-  size_t bytesWrittenTotal = 0;
-  const unsigned int getrandomFlags = GRND_NONBLOCK;
-
-  do {
-    void *const currentTarget = (void *)((char *)target + bytesWrittenTotal);
-    const size_t bytesToWrite = count - bytesWrittenTotal;
-
-    const int bytesWrittenMore =
-#    if defined(HAVE_GETRANDOM)
-        getrandom(currentTarget, bytesToWrite, getrandomFlags);
-#    else
-        syscall(SYS_getrandom, currentTarget, bytesToWrite, getrandomFlags);
-#    endif
-
-    if (bytesWrittenMore > 0) {
-      bytesWrittenTotal += bytesWrittenMore;
-      if (bytesWrittenTotal >= count)
-        success = 1;
-    }
-  } while (! success && (errno == EINTR));
-
-  return success;
-}
-
-#  endif /* defined(HAVE_GETRANDOM) || defined(HAVE_SYSCALL_GETRANDOM) */
-
-#  if ! defined(_WIN32) && defined(XML_DEV_URANDOM)
-
-/* Extract entropy from /dev/urandom */
-static int
-writeRandomBytes_dev_urandom(void *target, size_t count) {
-  int success = 0; /* full count bytes written? */
-  size_t bytesWrittenTotal = 0;
-
-  const int fd = open("/dev/urandom", O_RDONLY);
-  if (fd < 0) {
-    return 0;
-  }
-
-  do {
-    void *const currentTarget = (void *)((char *)target + bytesWrittenTotal);
-    const size_t bytesToWrite = count - bytesWrittenTotal;
-
-    const ssize_t bytesWrittenMore = read(fd, currentTarget, bytesToWrite);
-
-    if (bytesWrittenMore > 0) {
-      bytesWrittenTotal += bytesWrittenMore;
-      if (bytesWrittenTotal >= count)
-        success = 1;
-    }
-  } while (! success && (errno == EINTR));
-
-  close(fd);
-  return success;
-}
-
-#  endif /* ! defined(_WIN32) && defined(XML_DEV_URANDOM) */
-
-#endif /* ! defined(HAVE_ARC4RANDOM_BUF) && ! defined(HAVE_ARC4RANDOM) */
-
-#if defined(HAVE_ARC4RANDOM) && ! defined(HAVE_ARC4RANDOM_BUF)
-
-static void
-writeRandomBytes_arc4random(void *target, size_t count) {
-  size_t bytesWrittenTotal = 0;
-
-  while (bytesWrittenTotal < count) {
-    const uint32_t random32 = arc4random();
-    size_t i = 0;
-
-    for (; (i < sizeof(random32)) && (bytesWrittenTotal < count);
-         i++, bytesWrittenTotal++) {
-      const uint8_t random8 = (uint8_t)(random32 >> (i * 8));
-      ((uint8_t *)target)[bytesWrittenTotal] = random8;
-    }
-  }
-}
-
-#endif /* defined(HAVE_ARC4RANDOM) && ! defined(HAVE_ARC4RANDOM_BUF) */
-
-#ifdef _WIN32
-
-/* Provide declaration of rand_s() for MinGW-32 (not 64, which has it),
-   as it didn't declare it in its header prior to version 5.3.0 of its
-   runtime package (mingwrt, containing stdlib.h).  The upstream fix
-   was introduced at https://osdn.net/projects/mingw/ticket/39658 . */
-#  if defined(__MINGW32__) && defined(__MINGW32_VERSION)                       \
-      && __MINGW32_VERSION < 5003000L && ! defined(__MINGW64_VERSION_MAJOR)
-__declspec(dllimport) int rand_s(unsigned int *);
-#  endif
-
-/* Obtain entropy on Windows using the rand_s() function which
- * generates cryptographically secure random numbers.  Internally it
- * uses RtlGenRandom API which is present in Windows XP and later.
- */
-static int
-writeRandomBytes_rand_s(void *target, size_t count) {
-  size_t bytesWrittenTotal = 0;
-
-  while (bytesWrittenTotal < count) {
-    unsigned int random32 = 0;
-    size_t i = 0;
-
-    if (rand_s(&random32))
-      return 0; /* failure */
-
-    for (; (i < sizeof(random32)) && (bytesWrittenTotal < count);
-         i++, bytesWrittenTotal++) {
-      const uint8_t random8 = (uint8_t)(random32 >> (i * 8));
-      ((uint8_t *)target)[bytesWrittenTotal] = random8;
-    }
-  }
-  return 1; /* success */
-}
-
-#endif /* _WIN32 */
-
-#if ! defined(HAVE_ARC4RANDOM_BUF) && ! defined(HAVE_ARC4RANDOM)
-
-static unsigned long
-gather_time_entropy(void) {
-#  ifdef _WIN32
-  FILETIME ft;
-  GetSystemTimeAsFileTime(&ft); /* never fails */
-  return ft.dwHighDateTime ^ ft.dwLowDateTime;
-#  else
-  struct timeval tv;
-  int gettimeofday_res;
-
-  gettimeofday_res = gettimeofday(&tv, NULL);
-
-#    if defined(NDEBUG)
-  (void)gettimeofday_res;
-#    else
-  assert(gettimeofday_res == 0);
-#    endif /* defined(NDEBUG) */
-
-  /* Microseconds time is <20 bits entropy */
-  return tv.tv_usec;
-#  endif
-}
-
-#endif /* ! defined(HAVE_ARC4RANDOM_BUF) && ! defined(HAVE_ARC4RANDOM) */
-
 static unsigned long
 ENTROPY_DEBUG(const char *label, unsigned long entropy) {
   if (getDebugLevel("EXPAT_ENTROPY_DEBUG", 0) >= 1u) {
@@ -950,42 +741,8 @@ generate_hash_secret_salt(XML_Parser parser) {
   unsigned long entropy;
   (void)parser;
 
-  /* "Failproof" high quality providers: */
-#if defined(HAVE_ARC4RANDOM_BUF)
-  arc4random_buf(&entropy, sizeof(entropy));
-  return ENTROPY_DEBUG("arc4random_buf", entropy);
-#elif defined(HAVE_ARC4RANDOM)
-  writeRandomBytes_arc4random((void *)&entropy, sizeof(entropy));
-  return ENTROPY_DEBUG("arc4random", entropy);
-#else
-  /* Try high quality providers first .. */
-#  ifdef _WIN32
-  if (writeRandomBytes_rand_s((void *)&entropy, sizeof(entropy))) {
-    return ENTROPY_DEBUG("rand_s", entropy);
-  }
-#  elif defined(HAVE_GETRANDOM) || defined(HAVE_SYSCALL_GETRANDOM)
-  if (writeRandomBytes_getrandom_nonblock((void *)&entropy, sizeof(entropy))) {
-    return ENTROPY_DEBUG("getrandom", entropy);
-  }
-#  endif
-#  if ! defined(_WIN32) && defined(XML_DEV_URANDOM)
-  if (writeRandomBytes_dev_urandom((void *)&entropy, sizeof(entropy))) {
-    return ENTROPY_DEBUG("/dev/urandom", entropy);
-  }
-#  endif /* ! defined(_WIN32) && defined(XML_DEV_URANDOM) */
-  /* .. and self-made low quality for backup: */
-
-  /* Process ID is 0 bits entropy if attacker has local access */
-  entropy = gather_time_entropy() ^ getpid();
-
-  /* Factors are 2^31-1 and 2^61-1 (Mersenne primes M31 and M61) */
-  if (sizeof(unsigned long) == 4) {
-    return ENTROPY_DEBUG("fallback(4)", entropy * 2147483647);
-  } else {
-    return ENTROPY_DEBUG("fallback(8)",
-                         entropy * (unsigned long)2305843009213693951ULL);
-  }
-#endif
+  webc_getrandom(&entropy, sizeof(entropy));
+  return ENTROPY_DEBUG("webc_getrandom", entropy);
 }
 
 static unsigned long
@@ -8518,19 +8275,6 @@ unsignedCharToPrintable(unsigned char c) {
 
 static unsigned long
 getDebugLevel(const char *variableName, unsigned long defaultDebugLevel) {
-  const char *const valueOrNull = getenv(variableName);
-  if (valueOrNull == NULL) {
-    return defaultDebugLevel;
-  }
-  const char *const value = valueOrNull;
-
-  errno = 0;
-  char *afterValue = NULL;
-  unsigned long debugLevel = strtoul(value, &afterValue, 10);
-  if ((errno != 0) || (afterValue == value) || (afterValue[0] != '\0')) {
-    errno = 0;
-    return defaultDebugLevel;
-  }
-
-  return debugLevel;
+  (void)variableName;
+  return defaultDebugLevel;
 }

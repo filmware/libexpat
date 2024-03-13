@@ -104,10 +104,12 @@ AC_SUBST(LIBREVISION)
 AC_SUBST(LIBAGE)
 
 AC_LANG([C])
-AC_PROG_CC_C99
 
-AS_IF([test "${ac_cv_prog_cc_c99}" = no],
-  [AC_MSG_ERROR([Expat requires a C99 compiler.])])
+# webc says: of course clang supports C99.  Get real.
+# AC_PROG_CC_C99
+#
+# AS_IF([test "${ac_cv_prog_cc_c99}" = no],
+#   [AC_MSG_ERROR([Expat requires a C99 compiler.])])
 
 AS_IF([test "$GCC" = yes],
   [AX_APPEND_COMPILE_FLAGS([-Wall -Wextra], [AM_CFLAGS])
@@ -156,6 +158,7 @@ dnl wrong when cross compiling, now (2018, GNU Autoconf 2.69) we assume
 dnl it is fine.
 AC_C_BIGENDIAN([AC_DEFINE([WORDS_BIGENDIAN], 1)
                 AS_VAR_SET([BYTEORDER], 4321)],
+               [AS_VAR_SET([BYTEORDER], 1234)],
                [AS_VAR_SET([BYTEORDER], 1234)])
 AC_DEFINE_UNQUOTED([BYTEORDER], $BYTEORDER, [1234 = LILENDIAN, 4321 = BIGENDIAN])
 
